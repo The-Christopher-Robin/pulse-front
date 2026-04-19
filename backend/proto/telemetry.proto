@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package pulsefront.telemetry.v1;
+
+option go_package = "github.com/The-Christopher-Robin/pulse-front/backend/internal/grpcapi/pb;pb";
+
+service TelemetryService {
+  rpc RecordExposure(ExposureRequest) returns (ExposureResponse);
+  rpc RecordEvent(EventRequest) returns (EventResponse);
+}
+
+message ExposureRequest {
+  string experiment_key = 1;
+  string variant_key    = 2;
+  string user_id        = 3;
+  int64  timestamp_ms   = 4;
+}
+
+message ExposureResponse {
+  bool accepted = 1;
+}
+
+message EventRequest {
+  string user_id      = 1;
+  string event_type   = 2;
+  string target_id    = 3;
+  int64  timestamp_ms = 4;
+  map<string, string> properties = 5;
+}
+
+message EventResponse {
+  bool accepted = 1;
+}
