@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pulse
+      POSTGRES_PASSWORD: pulse
+      POSTGRES_DB: pulse
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pulse -d pulse"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      HTTP_ADDR: ":8080"
+      GRPC_ADDR: ":9090"
+      POSTGRES_URL: "postgres://pulse:pulse@postgres:5432/pulse?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      ALLOWED_ORIGIN: "http://localhost:3000"
+      ENVIRONMENT: "dev"
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    environment:
+      BACKEND_URL: "http://backend:8080"
+      NEXT_PUBLIC_BACKEND_URL: "/api/proxy"
+    ports:
+      - "3000:3000"
+
+volumes:
+  pg_data:
