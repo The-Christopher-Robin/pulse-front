@@ -1,0 +1,194 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: backend (go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./... -race -count=1 -timeout 90s
+
+  frontend:
+    name: frontend (next.js)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      - name: type-check
+        run: npx tsc --noEmit
+
+      - name: jest
+        run: npm test -- --ci --colors=false
+
+      - name: next build
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+          NEXT_PUBLIC_API_BASE: http://localhost:8080
+          API_BASE_SSR: http://localhost:8080
+        run: npm run build
+
+  integration:
+    name: integration (server + postgres + redis)
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pulse
+          POSTGRES_PASSWORD: pulse
+          POSTGRES_DB: pulse
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pulse -d pulse"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      POSTGRES_URL: postgres://pulse:pulse@localhost:5432/pulse?sslmode=disable
+      REDIS_ADDR: localhost:6379
+      HTTP_ADDR: :8080
+      GRPC_ADDR: :9090
+      ALLOWED_ORIGIN: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Start server
+        working-directory: backend
+        run: |
+          set -euxo pipefail
+          nohup go run ./cmd/server > /tmp/server.log 2>&1 &
+          echo $! > /tmp/server.pid
+
+      - name: Wait for /healthz
+        run: |
+          set -eu
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8080/healthz > /dev/null; then
+              echo "server up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::server never reported healthy"
+          echo "---- server.log ----"
+          cat /tmp/server.log || true
+          exit 1
+
+      - name: Smoke test REST surface
+        run: |
+          set -euo pipefail
+
+          echo "--- GET /healthz"
+          curl -fsS http://localhost:8080/healthz
+          echo
+
+          echo "--- GET /api/v1/products"
+          curl -fsS -H "X-User-Id: ci-user" http://localhost:8080/api/v1/products \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); n=len(d['products']); assert n>=5, d; print(f'products ok: {n}')"
+
+          echo "--- GET /api/v1/products/p-runner-01"
+          curl -fsS -H "X-User-Id: ci-user" http://localhost:8080/api/v1/products/p-runner-01 \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['id']=='p-runner-01', d; print('product-by-id ok')"
+
+          echo "--- GET /api/v1/experiments"
+          curl -fsS -H "X-User-Id: ci-user" http://localhost:8080/api/v1/experiments \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); n=len(d['experiments']); assert n>=20, d; print(f'experiments ok: {n}')"
+
+          echo "--- GET /api/v1/assignments (sticky bucketing)"
+          A1=$(curl -fsS -H "X-User-Id: user-alpha" http://localhost:8080/api/v1/assignments \
+               | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps({k:v['variant_key'] for k,v in d['assignments'].items()}, sort_keys=True))")
+          A2=$(curl -fsS -H "X-User-Id: user-alpha" http://localhost:8080/api/v1/assignments \
+               | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps({k:v['variant_key'] for k,v in d['assignments'].items()}, sort_keys=True))")
+          if [ "$A1" != "$A2" ]; then
+            echo "::error::assignments are not sticky for the same user"
+            echo "first:  $A1"
+            echo "second: $A2"
+            exit 1
+          fi
+          B=$(curl -fsS -H "X-User-Id: user-beta" http://localhost:8080/api/v1/assignments \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps({k:v['variant_key'] for k,v in d['assignments'].items()}, sort_keys=True))")
+          if [ "$A1" = "$B" ]; then
+            echo "::error::user-alpha and user-beta landed on identical variants, bucketing is broken"
+            exit 1
+          fi
+          echo "sticky + independent bucketing ok"
+
+          echo "--- POST /api/v1/events"
+          code=$(curl -fsS -o /tmp/events.out -w "%{http_code}" -X POST \
+            -H "X-User-Id: ci-user" -H "Content-Type: application/json" \
+            -d '{"event_type":"page_view","target_id":"home","properties":{"ci":true}}' \
+            http://localhost:8080/api/v1/events)
+          if [ "$code" != "202" ]; then
+            echo "::error::expected 202 from /events, got $code"
+            cat /tmp/events.out
+            exit 1
+          fi
+          echo "events ok"
+
+      - name: Dump server log on failure
+        if: failure()
+        run: |
+          echo "---- server.log ----"
+          cat /tmp/server.log || true
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f /tmp/server.pid ]; then
+            kill "$(cat /tmp/server.pid)" 2>/dev/null || true
+          fi

@@ -1,5 +1,7 @@
 # PulseFront
 
+[![ci](https://github.com/The-Christopher-Robin/pulse-front/actions/workflows/ci.yml/badge.svg)](https://github.com/The-Christopher-Robin/pulse-front/actions/workflows/ci.yml)
+
 A full-stack customer-facing storefront with a Go backend and a Next.js SSR front-end,
 plus a typed A/B experiment framework (traffic splitting, sticky bucketing, exposure
 logging, conversion analytics).
